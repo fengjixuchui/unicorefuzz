@@ -2,3 +2,7 @@ avatar2
 capstone
 unicorn
 sh
+inotify
+angr
+# Kinda didn't start without psutil. Maybe I uninstalled it by accident?
+psutil

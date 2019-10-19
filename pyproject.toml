@@ -1,0 +1,15 @@
+[tool.black]
+target-version = ['py36', 'py37', 'py38']
+include = '''
+(
+    .*\.py$
+    | ucf
+)
+'''
+exclude = '''
+(
+    AFLplusplus
+    | uDdbg
+    | __pycache__
+)
+'''
