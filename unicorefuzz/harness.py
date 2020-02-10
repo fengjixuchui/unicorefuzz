@@ -3,24 +3,25 @@
 Main (Unicorn-)Harness, used alongside AFL.
 """
 import argparse
+import gc
 import os
 import sys
 import time
 from typing import Optional, Tuple, Dict, List
 
 from capstone import Cs
-from unicorn import *
-from unicorn.x86_const import *
+from unicornafl import *
 
 from unicorefuzz import x64utils
 from unicorefuzz.unicorefuzz import (
     Unicorefuzz,
     REJECTED_ENDING,
     X64,
-    uc_get_pc,
     uc_reg_const,
 )
-from unicorefuzz.x64utils import syscall_exit_hook
+
+# no need to print if we're muted
+CHILD_SHOULD_PRINT = os.getenv("AFL_DEBUG_CHILD_OUTPUT")
 
 
 def unicorn_debug_instruction(
@@ -32,7 +33,12 @@ def unicorn_debug_instruction(
         for (cs_address, cs_size, cs_mnemonic, cs_opstr) in cs.disasm_lite(
             bytes(mem), size
         ):
-            print("    Instr: {:#016x}:\t{}\t{}".format(address, cs_mnemonic, cs_opstr))
+            if CHILD_SHOULD_PRINT:
+                print(
+                    "    Instr: {:#016x}:\t{}\t{}".format(
+                        address, cs_mnemonic, cs_opstr
+                    )
+                )
     except Exception as e:
         print(hex(address))
         print("e: {}".format(e))
@@ -64,19 +70,24 @@ def unicorn_debug_mem_invalid_access(
     uc: Uc, access: int, address: int, size: int, value: int, user_data: "Harness"
 ):
     harness = user_data  # type Unicorefuzz
-    print(
-        "unicorn_debug_mem_invalid_access(uc={}, access={}, addr=0x{:016x}, size={}, value={}, ud={})".format(
-            uc, access, address, size, value, user_data
-        )
-    )
-    if access == UC_MEM_WRITE_UNMAPPED:
+    if CHILD_SHOULD_PRINT:
         print(
-            "        >>> INVALID Write: addr=0x{:016x} size={} data=0x{:016x}".format(
-                address, size, value
+            "unicorn_debug_mem_invalid_access(uc={}, access={}, addr=0x{:016x}, size={}, value={}, ud={}, afl_child={})".format(
+                uc, access, address, size, value, user_data, user_data.is_afl_child
             )
         )
+    if access == UC_MEM_WRITE_UNMAPPED:
+        if CHILD_SHOULD_PRINT:
+            print(
+                "        >>> INVALID Write: addr=0x{:016x} size={} data=0x{:016x}".format(
+                    address, size, value
+                )
+            )
     else:
-        print("        >>> INVALID Read: addr=0x{:016x} size={}".format(address, size))
+        if CHILD_SHOULD_PRINT:
+            print(
+                "        >>> INVALID Read: addr=0x{:016x} size={}".format(address, size)
+            )
     try:
         harness.map_page(uc, address)
     except KeyboardInterrupt:
@@ -93,6 +104,8 @@ class Harness(Unicorefuzz):
     def __init__(self, config) -> None:
         super().__init__(config)
         self.fetched_regs = None  # type: Optional[Dict[str, int]]
+        # Will be set to true if we are a afl-forkser child.
+        self.is_afl_child = False  # type: bool
 
     def harness(self, input_file: str, wait: bool, debug: bool, trace: bool) -> None:
         """
@@ -102,13 +115,39 @@ class Harness(Unicorefuzz):
         :param debug: if we should enable unicorn debugger
         :param trace: trace or not
         """
+
+        # Exit without clean python vm shutdown:
+        # "The os._exit() function can be used if it is absolutely positively necessary to exit immediately"
+        # Many times faster!
+        # noinspection PyProtectedMember
+        exit_func = os._exit if not os.getenv("UCF_DEBUG_CLEAN_SHUTDOWN") else exit
+
+        # In case we need an easy way to debug mem loads etc.
+        init_sleep = os.getenv("UCF_DEBUG_SLEEP_BEFORE_INIT")
+        if init_sleep:
+            print(
+                "[d] Sleeping. Unicorn init will start in {} seconds.".format(
+                    init_sleep
+                )
+            )
+            time.sleep(float(init_sleep))
+
+        if debug or trace:
+            # TODO: Find a nicer way to do this :)
+            global CHILD_SHOULD_PRINT
+            CHILD_SHOULD_PRINT = True
+
         uc, entry, exits = self.uc_init(
             input_file, wait, trace, verbose=(debug or trace)
         )
         if debug:
-            self.uc_debug(uc, entry_point=entry, exit_point=exits[0])
+            self.uc_debug(uc, input_file, exits)
+            print("[*] Debugger finished :)")
         else:
-            self.uc_run(uc, entry, exits[0])
+            if self.uc_fuzz(uc, input_file, exits):
+                print("[*] Done fuzzing. Cya.")
+            else:
+                print("[*] Finished one run (without AFL).")
 
     def uc_init(
         self, input_file, wait: bool = False, trace: bool = False, verbose: bool = False
@@ -146,66 +185,66 @@ class Harness(Unicorefuzz):
         config.init_func(self, uc)
 
         # get pc from unicorn state since init_func may have altered it.
-        pc = uc_get_pc(uc, self.arch)
-        exits = self.calculate_exits(pc)
-        # mappings used in init_func didn't have the pc yet.
-        for ex in self._deferred_exits:
-            self.set_exits(uc, ex, exits)
+        pc = self.uc_read_pc(uc)
         self.map_known_mem(uc)
+
+        exits = self.calculate_exits(pc)
         if not exits:
             raise ValueError(
                 "No exits founds. Would run forever... Please set an exit address in config.py."
             )
-        entry_point = pc
 
         # On error: map memory, add exits.
         uc.hook_add(UC_HOOK_MEM_UNMAPPED, unicorn_debug_mem_invalid_access, self)
 
-        if len(exits) > 1:
-            # unicorn supports a single exit only (using the length param).
-            # We'll path the binary on load if we have need to support more.
-            if self.arch == X64:
-                uc.hook_add(
-                    UC_HOOK_INSN,
-                    syscall_exit_hook,
-                    user_data=(exits, os._exit),
-                    arg1=UC_X86_INS_SYSCALL,
-                )
-            else:
-                # TODO: (Fast) solution for X86, ARM, ...
-                raise Exception(
-                    "Multiple exits not yet supported for arch {}".format(self.arch)
-                )
+        if os.getenv("UCF_DEBUG_MEMORY"):
+            from pympler import muppy, summary
 
-        # starts the afl forkserver
-        self.uc_start_forkserver(uc)
+            all_objects = muppy.get_objects()
+            sum1 = summary.summarize(all_objects)
+            summary.print_(sum1)
 
-        input_file = open(input_file, "rb")  # load afl's input
-        input = input_file.read()
-        input_file.close()
-
-        try:
-            config.place_input(self, uc, input)
-        except Exception as ex:
-            raise Exception(
-                "[!] Error setting testcase for input {}: {}".format(input, ex)
+        # Last chance to hook before forkserver starts (if running as afl child)
+        fork_sleep = os.getenv("UCF_DEBUG_SLEEP_BEFORE_FORK")
+        if fork_sleep:
+            print(
+                "[d] Sleeping. Forkserver will start in {} seconds.".format(fork_sleep)
             )
-        return uc, entry_point, exits
+            time.sleep(float(fork_sleep))
 
-    def uc_debug(self, uc: Uc, entry_point: int, exit_point: int) -> None:
+        return uc, pc, exits
+
+    def uc_debug(self, uc: Uc, input_file: str, exits: List[int]) -> None:
         """
         Start uDdbg debugger for the given unicorn instance
         :param uc: The unicorn instance
-        :param entry_point: Where to start
-        :param exit_point: Exit point
+        :param input_file: The (afl)input file to read
+        :param exits: List of exits that end fuzzing
         """
         print("[*] Loading debugger...")
-        sys.path.append(self.uddbg_path)
-        print(sys.path)
         # noinspection PyUnresolvedReferences
         from udbg import UnicornDbg
 
         udbg = UnicornDbg()
+
+        # The afl_forkserver_start() method sets the exits correctly.
+        # We don't want to actually fork, though, so make sure that return is False.
+        if uc.afl_forkserver_start(exits):
+            raise Exception(
+                "Debugger cannot run in AFL! Did you mean -t instead of -d?"
+            )
+
+        with open(input_file, "rb") as f:  # load AFL's input
+            input = f.read()
+        try:
+            self.config.place_input(self, uc, input)
+        except Exception as ex:
+            raise Exception(
+                "[!] Error setting testcase for input {}: {}".format(input, ex)
+            )
+
+        entry_point = self.uc_read_pc(uc)
+        exit_point = self.exits[0]
 
         # uddbg wants to know some mappings, read the current stat from unicorn to have $something...
         # TODO: Handle mappings differently? Update them at some point? + Proper exit after run?
@@ -230,26 +269,41 @@ class Harness(Unicorefuzz):
         # TODO will never reach done, probably.
         print("[*] Done.")
 
-    def uc_run(self, uc: Uc, entry_point: int, exit_point: int) -> None:
+    def uc_fuzz(self, uc: Uc, input_file: str, exits: List[int]) -> bool:
         """
         Run initialized unicorn
-        :param entry_point: The entry point
-        :param exit_point: First final address. Hack something to get more exits
-        :param uc: The unicorn instance to run
+        :param uc: the Unicorn instance  to work on
+        :param input_file: The afl input file
+        :param exits: List of exit addresses to end fuzzing at
+
+        :returns: True, if we're in the parent after fuzzing, False otherwise.
         """
+
+        def input_callback(uc: Uc, input: bytes, persistent_round: int, data: Harness):
+            # We need to reset the entry point for persistence mode.
+            self.config.place_input(data, uc, input)
+
+        # def crash_callback(
+        #    uc: Uc, uc_ret: UcError, input: bytes, persistent_round: int, data: Harness
+        # ):
+        #   print("input", uc, uc_ret, input, persistent_round, data)
+        #   print("crashing", args)
+
         try:
-            uc.emu_start(begin=entry_point, until=exit_point, timeout=0, count=0)
+            return uc.afl_fuzz(
+                input_file=input_file,
+                place_input_callback=input_callback,
+                exits=exits,
+                validate_crash_callback=None,  # TODO: self.crash_callback,
+                persistent_iters=1,  # TODO: Still needs some sort of reset between runs!
+                data=self,
+            )
         except UcError as e:
             print(
                 "[!] Execution failed with error: {} at address {:x}".format(
-                    e, uc_get_pc(uc, self.arch)
+                    e, self.uc_read_pc(uc)
                 )
             )
-            self.force_crash(e)
-        # Exit without clean python vm shutdown:
-        # "The os._exit() function can be used if it is absolutely positively necessary to exit immediately"
-        # Many times faster!
-        os._exit(0)
 
     def map_known_mem(self, uc: Uc):
         """
@@ -267,36 +321,6 @@ class Harness(Unicorefuzz):
                     self.map_page(uc, address)
                 except Exception:
                     pass
-
-    def uc_start_forkserver(self, uc: Uc):
-        """
-        Starts the forkserver by executing an instruction on some scratch register
-        :param uc: The unicorn to fork
-        """
-        scratch_addr = self.config.SCRATCH_ADDR
-        scratch_size = self.config.SCRATCH_SIZE
-        arch = self.arch
-
-        sys.stdout.flush()  # otherwise children will inherit the unflushed buffer
-        uc.mem_map(scratch_addr, scratch_size)
-
-        if self.arch == X64:
-            # prepare to do base register things
-            regs = self.fetch_all_regs()
-            gs_base = regs["gs_base"]
-            fs_base = regs["fs_base"]
-
-            # This will execute code -> starts afl-unicorn forkserver!
-            x64utils.set_gs_base(uc, scratch_addr, gs_base)
-            # print("[d] setting gs_base to "+hex(gs))
-            x64utils.set_fs_base(uc, scratch_addr, fs_base)
-            # print("[d] setting fs_base to "+hex(gs))
-        else:
-            # We still need to start the forkserver somehow to be consistent.
-            # Let's emulate a nop for this.
-            uc.mem_map(scratch_addr, scratch_size)
-            uc.mem_write(scratch_addr, arch.insn_nop)
-            uc.emu_start(scratch_addr, until=0, count=1)
 
     def _raise_if_reject(self, base_address: int, dump_file_name: str) -> None:
         """
@@ -329,7 +353,10 @@ class Harness(Unicorefuzz):
             # Creating the input file == request
             if not os.path.isfile(dump_file_name):
                 open(input_file_name, "a").close()
-            print("Requesting page 0x{:016x} from `ucf attach`".format(base_address))
+            if self.should_log:
+                print(
+                    "Requesting page 0x{:016x} from `ucf attach`".format(base_address)
+                )
             while 1:
                 self._raise_if_reject(base_address, dump_file_name)
                 try:
@@ -360,7 +387,7 @@ class Harness(Unicorefuzz):
         regs = self.fetch_all_regs()
         for key, value in regs.items():
             if key in self.arch.ignored_regs:
-                # print("[d] Ignoring reg: {} (Ignored)".format(r))
+                # print("[d] Ignoring reg: {} (Ignored)".format(key))
                 continue
             try:
                 uc.reg_write(uc_reg_const(self.arch, key), value)
@@ -385,12 +412,28 @@ class Harness(Unicorefuzz):
         :return: register content
         """
         reg_name = reg_name.lower()
-        if reg_name == "fs_base":
-            return x64utils.get_fs_base(uc, self.config.SCRATCH_ADDR)
-        if reg_name == "gs_base":
-            return x64utils.get_gs_base(uc, self.config.SCRATCH_ADDR)
-        else:
-            return uc.reg_read(self.uc_reg_const(reg_name))
+        # if reg_name == "fs_base":
+        #    return x64utils.get_fs_base(uc, self.config.SCRATCH_ADDR)
+        # if reg_name == "gs_base":
+        #    return x64utils.get_gs_base(uc, self.config.SCRATCH_ADDR)
+        # else:
+        return uc.reg_read(self.uc_reg_const(reg_name))
+
+    def uc_reg_write(self, uc: Uc, reg_name: str, val: int) -> int:
+        """
+        Reads a register by name, resolving the UC const for the current architecture.
+        Handles potential special cases like base registers
+        :param uc: the unicorn instance to read the register from
+        :param reg_name: the register name
+        :param val: the register content
+        """
+        reg_name = reg_name.lower()
+        # if reg_name == "fs_base":
+        #    return x64utils.get_fs_base(uc, self.config.SCRATCH_ADDR)
+        # if reg_name == "gs_base":
+        #    return x64utils.get_gs_base(uc, self.config.SCRATCH_ADDR)
+        # else:
+        return uc.reg_write(self.uc_reg_const(reg_name), val)
 
     def uc_read_page(self, uc: Uc, addr: int) -> Tuple[int, bytes]:
         """
@@ -419,49 +462,20 @@ class Harness(Unicorefuzz):
                     pass
         return self.fetched_regs
 
-    def uc_get_pc(self, uc) -> int:
+    def uc_read_pc(self, uc) -> int:
         """
         Gets the current pc from unicorn for this arch
         :param uc: the unicorn instance
         :return: value of the pc
         """
-        return uc_get_pc(uc, self.arch)
+        # noinspection PyUnresolvedReferences
+        return uc.reg_read(uc_reg_const(self.arch, self.arch.pc_name))
 
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Test harness for our sample kernel module"
-    )
-    parser.add_argument(
-        "input_file",
-        type=str,
-        help="Path to the file containing the mutated input to load",
-    )
-    parser.add_argument(
-        "-c", "--config", type=str, default="config.py", help="The config file to use."
-    )
-    parser.add_argument(
-        "-d",
-        "--debug",
-        default=False,
-        action="store_true",
-        help="Starts the testcase in uUdbg (if installed)",
-    )
-    parser.add_argument(
-        "-t",
-        "--trace",
-        default=False,
-        action="store_true",
-        help="Enables debug tracing",
-    )
-    parser.add_argument(
-        "-w",
-        "--wait",
-        default=False,
-        action="store_true",
-        help="Wait for the state directory to be present",
-    )
-    args = parser.parse_args()
-
-    Harness(args.config)
-    Harness.harness(args.input_file, debug=args.debug, trace=args.trace, wait=args.wait)
+    def uc_write_pc(self, uc, val) -> int:
+        """
+        Sets the program counter of a unicorn instance
+        :param uc: Unicorn instance
+        :param arch: the architecture to use
+        :param val: the value to write
+        """
+        return uc.reg_write(uc_reg_const(self.arch, self.arch.pc_name), val)
